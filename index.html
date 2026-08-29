@@ -422,9 +422,13 @@ async function handleSignUp() {
   setAuthError('');
   if (!email || !password) { setAuthError('Enter your email and password.'); return; }
   if (password.length < 6) { setAuthError('Password must be at least 6 characters.'); return; }
-  const { error } = await supabaseClient.auth.signUp({ email, password });
+  const { data, error } = await supabaseClient.auth.signUp({ email, password });
   if (error) { setAuthError(error.message); return; }
-  setAuthError('Account created. Check your email to confirm, then sign in.', true);
+  if (data && data.session) {
+    setAuthError('Account created and signed in as ' + email + '.', true);
+  } else {
+    setAuthError('Account created for ' + email + '. Check your email to confirm, then sign in.', true);
+  }
 }
 async function handleSignOut() {
   await supabaseClient.auth.signOut();
@@ -476,15 +480,25 @@ function exportBackupJson() {
 // Writes a previously exported backup into Supabase. Only meaningful once this file is opened
 // standalone (outside Claude), since it needs real network access to persist().
 async function restoreFromBackupJson(jsonText) {
-  const backup = JSON.parse(jsonText);
-  const map = {
-    'budget:items': backup.items, 'budget:income': backup.income, 'budget:salary': backup.salary,
-    'budget:debts': backup.debts, 'budget:theme': backup.theme, 'budget:goal': backup.goal,
-    'budget:hasPrivateCover': backup.hasPrivateCover, 'budget:netWorth': backup.netWorth,
-  };
-  for (const [key, value] of Object.entries(map)) {
-    if (value !== undefined) await persist(key, value);
+  const parsed = JSON.parse(jsonText);
+  let map;
+  if (Array.isArray(parsed)) {
+    // Raw Supabase SQL Editor export: [{key: "budget:items", value: [...]}, ...]
+    map = {};
+    parsed.forEach(row => { if (row && row.key) map[row.key] = row.value; });
+  } else {
+    // This app's own "Download full backup" format: {items, income, salary, ...}
+    map = {
+      'budget:items': parsed.items, 'budget:income': parsed.income, 'budget:salary': parsed.salary,
+      'budget:debts': parsed.debts, 'budget:theme': parsed.theme, 'budget:goal': parsed.goal,
+      'budget:hasPrivateCover': parsed.hasPrivateCover, 'budget:netWorth': parsed.netWorth,
+    };
   }
+  let restoredCount = 0;
+  for (const [key, value] of Object.entries(map)) {
+    if (value !== undefined && value !== null) { await persist(key, value); restoredCount++; }
+  }
+  return restoredCount;
 }
 
 async function loadState() {
@@ -829,6 +843,7 @@ function render() {
 
   const app = document.getElementById('app');
   app.innerHTML = `
+    <div style="text-align:right; font-size:11px; color:var(--text-tertiary); margin-bottom:6px;">Signed in as ${escapeHtml(currentUser ? currentUser.email : '')}</div>
     <div class="header-row">
       <div class="eyebrow">Monthly Overview</div>
       <div style="display:flex; align-items:center; gap:10px;">
@@ -839,8 +854,7 @@ function render() {
         <button class="sign-out-btn" id="sign-out-btn">Sign out</button>
       </div>
     </div>
-    <div class="hero">
-      <div class="hero-row">
+    <div class="hero">      <div class="hero-row">
         <h1 class="hero-value" id="hero-value-num">${fmt(totals.remainingMonthly, 2)}</h1>
         <span class="hero-label">left after expenses</span>
       </div>
@@ -1640,8 +1654,12 @@ function attachListeners() {
       try {
         const text = await file.text();
         if (!confirm('Restore this backup? It will overwrite the data currently in your database.')) return;
-        await restoreFromBackupJson(text);
-        alert('Restored. Reloading with your restored data...');
+        const count = await restoreFromBackupJson(text);
+        if (count === 0) {
+          alert("That file didn't contain any recognizable data — nothing was changed. Double-check it's the right backup file.");
+          return;
+        }
+        alert('Restored ' + count + ' field(s). Reloading with your restored data...');
         location.reload();
       } catch (err) {
         alert("Couldn't read that file: " + errText(err));
